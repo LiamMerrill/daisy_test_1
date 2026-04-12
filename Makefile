@@ -1,12 +1,11 @@
 # Project Name
-TARGET = pod_audio_test
+TARGET = pod_sample_test
 
 # Sources
-CPP_SOURCES = pod_audio_test.cpp
+CPP_SOURCES = pod_sample_test.cpp
 
 # Library Locations
 LIBDAISY_DIR = ../libDaisy
-DAISYSP_DIR = ../DaisySP
 
 # Core location, and generic Makefile.
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
