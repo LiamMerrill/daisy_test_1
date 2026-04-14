@@ -1,180 +1,160 @@
+#include "daisy_pod.h"
 #include "daisy_seed.h"
+#include "fatfs.h"
 #include <string.h>
 
 using namespace daisy;
 
-DaisySeed hw;
+// GLOBALS
+DaisyPod       hw;
+SdmmcHandler   sdmmc;
 FatFSInterface fsi;
-GPIO button;
+FIL            file;
 
-// Audio buffer in SDRAM
-DSY_SDRAM_BSS float audio_buffer[48000];
+// 🔥 BIG BUFFER (SDRAM safe)
+DSY_SDRAM_BSS float audio_buffer[48000]; // 1 sec max
 int audio_length = 0;
 
-int playback_position = 0;
-bool is_playing = false;
+int playback_pos = 0;
+bool playing = false;
 
-void AudioCallback(AudioHandle::InputBuffer in, 
-                   AudioHandle::OutputBuffer out, 
-                   size_t size)
+// 🔊 Audio callback
+void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
+                   AudioHandle::InterleavingOutputBuffer out,
+                   size_t                                size)
 {
-    for(size_t i = 0; i < size; i++)
+    for(size_t i = 0; i < size; i += 2)
     {
         float sample = 0.0f;
-        
-        if(is_playing && playback_position < audio_length)
+
+        if(playing && playback_pos < audio_length)
         {
-            sample = audio_buffer[playback_position];
-            playback_position++;
-            
-            if(playback_position >= audio_length)
-            {
-                is_playing = false;
-                playback_position = 0;
-            }
+            sample = audio_buffer[playback_pos++] * 2.0f;
         }
-        
-        out[0][i] = sample;
-        out[1][i] = sample;
+
+        out[i]     = sample;
+        out[i + 1] = sample;
     }
 }
 
-bool LoadWavFromSD(const char* filename)
+// 🔍 Find data chunk
+uint32_t FindDataStart(FIL* file)
 {
-    FIL file;
-    UINT bytes_read;
-    
-    // Open file
-    if(f_open(&file, filename, FA_READ) != FR_OK)
+    f_lseek(file, 12);
+
+    while(1)
     {
-        return false;
-    }
-    
-    // Read WAV header (44 bytes)
-    uint8_t header[44];
-    f_read(&file, header, 44, &bytes_read);
-    
-    // Get sample count from header
-    uint32_t data_size = *(uint32_t*)(header + 40);
-    uint16_t bits_per_sample = *(uint16_t*)(header + 34);
-    uint16_t num_channels = *(uint16_t*)(header + 22);
-    
-    // Calculate number of samples
-    uint32_t bytes_per_sample = bits_per_sample / 8;
-    uint32_t total_samples = data_size / bytes_per_sample;
-    
-    // If stereo, we'll take left channel only
-    if(num_channels == 2)
-    {
-        total_samples /= 2;
-    }
-    
-    // Limit to buffer size
-    if(total_samples > 48000)
-    {
-        total_samples = 48000;
-    }
-    
-    audio_length = total_samples;
-    
-    // Read and convert samples
-    if(bits_per_sample == 16)
-    {
-        int16_t sample_buffer[256];
-        uint32_t samples_read = 0;
-        
-        while(samples_read < total_samples)
+        char chunk_id[4];
+        UINT br;
+
+        f_read(file, chunk_id, 4, &br);
+
+        uint32_t chunk_size;
+        f_read(file, &chunk_size, 4, &br);
+
+        if(memcmp(chunk_id, "data", 4) == 0)
         {
-            uint32_t to_read = (total_samples - samples_read > 256) ? 256 : (total_samples - samples_read);
-            
-            if(num_channels == 1)
-            {
-                // Mono - read directly
-                f_read(&file, sample_buffer, to_read * 2, &bytes_read);
-                
-                for(uint32_t i = 0; i < to_read; i++)
-                {
-                    audio_buffer[samples_read + i] = sample_buffer[i] / 32768.0f;
-                }
-            }
-            else
-            {
-                // Stereo - read and take left channel
-                int16_t stereo_buffer[512];
-                f_read(&file, stereo_buffer, to_read * 4, &bytes_read);
-                
-                for(uint32_t i = 0; i < to_read; i++)
-                {
-                    audio_buffer[samples_read + i] = stereo_buffer[i * 2] / 32768.0f;
-                }
-            }
-            
-            samples_read += to_read;
+            return f_tell(file);
+        }
+
+        // skip chunk (aligned)
+        f_lseek(file, f_tell(file) + ((chunk_size + 1) & ~1));
+    }
+}
+
+// 🔥 Load WAV into memory
+bool LoadWav()
+{
+    if(f_open(&file, "TEST.WAV", FA_READ) != FR_OK)
+        return false;
+
+    uint32_t data_start = FindDataStart(&file);
+    f_lseek(&file, data_start);
+
+    int16_t temp[256];
+    UINT br;
+    int total = 0;
+
+    while(total < 48000)
+    {
+        f_read(&file, temp, sizeof(temp), &br);
+
+        int samples = br / 2;
+
+        if(samples == 0)
+            break;
+
+        for(int i = 0; i < samples; i++)
+        {
+            audio_buffer[total++] = temp[i] / 32768.0f;
         }
     }
-    
+
+    audio_length = total;
+
     f_close(&file);
-    return true;
+    return (audio_length > 0);
 }
 
 int main(void)
 {
-    hw.Configure();
     hw.Init();
-    hw.StartLog();
-    
-    // Initialize SD card
-    FatFSInterface::Config sd_config;
-    sd_config.media = FatFSInterface::Config::MEDIA_SD;
-    fsi.Init(sd_config);
-    
-    // Mount SD card
-    f_mount(&fsi.GetSDFileSystem(), "/", 1);
-    
-    // Load WAV file from SD card
-    bool loaded = LoadWavFromSD("/clap_1sec.wav");
-    
-    if(loaded)
+
+    // Startup blink
+    for(int i = 0; i < 3; i++)
     {
-        // Blink LED to show success
-        for(int i = 0; i < 3; i++)
-        {
-            hw.SetLed(true);
-            System::Delay(100);
-            hw.SetLed(false);
-            System::Delay(100);
-        }
+        hw.seed.SetLed(true);
+        System::Delay(200);
+        hw.seed.SetLed(false);
+        System::Delay(200);
     }
-    
-    button.Init(hw.GetPin(27), GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
-    
+
+    // SD init
+    SdmmcHandler::Config sd_cfg;
+    sd_cfg.Defaults();
+    sdmmc.Init(sd_cfg);
+
+    fsi.Init(FatFSInterface::Config::MEDIA_SD);
+    FATFS& fs = fsi.GetSDFileSystem();
+    f_mount(&fs, "/", 1);
+
+    bool loaded = LoadWav();
+
+    if(loaded)
+        hw.led1.Set(0.0f, 1.0f, 0.0f); // green
+    else
+        hw.led1.Set(1.0f, 0.0f, 0.0f); // red
+
+    hw.UpdateLeds();
+
+    // Audio
     hw.SetAudioBlockSize(4);
-    hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
     hw.StartAudio(AudioCallback);
-    
-    bool last_button_state = true;
-    
-    while(1) 
+
+    bool last = false;
+
+    while(1)
     {
-        bool button_state = button.Read();
-        
-        if(last_button_state == true && button_state == false)
+        hw.ProcessDigitalControls();
+        bool current = hw.button1.Pressed();
+
+        // 🔥 EDGE DETECTION
+        if(current && !last)
         {
-            if(loaded)
-            {
-                is_playing = true;
-                playback_position = 0;
-                hw.SetLed(true);
-            }
+            playback_pos = 0;
+            playing = true;
+            hw.led1.Set(0.0f, 0.0f, 1.0f);
         }
-        
-        last_button_state = button_state;
-        
-        if(!is_playing)
+
+        if(!current)
         {
-            hw.SetLed(false);
+            playing = false;
+            hw.led1.Set(0.0f, 0.0f, 0.0f);
         }
-        
+
+        last = current;
+
+        hw.UpdateLeds();
         System::Delay(10);
     }
 }
